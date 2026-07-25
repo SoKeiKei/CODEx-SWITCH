@@ -7,4 +7,5 @@ This file is ASCII-only for safe encoding across terminals.
 - macOS/Linux: run `./run.sh` (first time: `chmod +x run.sh`)
 
 ## CLI
-- `python codex.py`
+- Windows: `py -3 codex.py`
+- macOS/Linux: `python3 codex.py`

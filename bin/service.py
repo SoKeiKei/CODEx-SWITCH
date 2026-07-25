@@ -1,20 +1,15 @@
 import json
 import os
-import glob
 import shutil
 import stat
 import base64
-import subprocess
-import signal
 import time
-import re
-import platform
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from .core import CodexCore
 
 class CodexService:
     ACCOUNTS_DIR = "codex-switch"
+    AUTH_FILENAME = "auth.json"
     
     def __init__(self, config_path: str = "config/accounts.json"):
         self.config_path = Path(__file__).parent.parent / config_path
@@ -25,14 +20,87 @@ class CodexService:
         
         self.accounts_dir = Path.home() / ".codex" / self.ACCOUNTS_DIR
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_accounts_to_email_keys()
 
     def get_accounts(self):
-        with open(self.config_path, 'r') as f:
+        with open(self.config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
 
     def save_accounts(self, accounts):
-        with open(self.config_path, 'w') as f:
-            json.dump(accounts, f, indent=4)
+        with open(self.config_path, 'w', encoding='utf-8') as f:
+            json.dump(accounts, f, ensure_ascii=False, indent=4)
+
+    def _migrate_accounts_to_email_keys(self):
+        accounts = self.get_accounts()
+        migrated = {}
+        changed = False
+
+        for key, data in accounts.items():
+            if not isinstance(data, dict):
+                continue
+
+            email = data.get("email") or key
+            new_key = email if "@" in email else key
+            account_data = dict(data)
+            account_data["email"] = email
+            account_data.pop("alias", None)
+
+            legacy_names = account_data.get("legacy_names", [])
+            if not isinstance(legacy_names, list):
+                legacy_names = []
+            old_legacy_aliases = account_data.pop("legacy_aliases", [])
+            if isinstance(old_legacy_aliases, list):
+                legacy_names.extend(old_legacy_aliases)
+            old_alias = data.get("alias")
+            for legacy in (key, old_alias):
+                if legacy and legacy != new_key and legacy not in legacy_names:
+                    legacy_names.append(legacy)
+                    changed = True
+            if legacy_names:
+                deduped = []
+                for legacy in legacy_names:
+                    if legacy and legacy != new_key and legacy not in deduped:
+                        deduped.append(legacy)
+                account_data["legacy_names"] = deduped
+
+            if key != new_key or data.get("alias") is not None or data.get("legacy_aliases") is not None:
+                changed = True
+
+            if new_key in migrated:
+                existing = migrated[new_key]
+                existing_names = existing.setdefault("legacy_names", [])
+                for legacy in account_data.get("legacy_names", []):
+                    if legacy not in existing_names:
+                        existing_names.append(legacy)
+                for field in ("account_id", "last_refresh", "saved_at"):
+                    if account_data.get(field) and not existing.get(field):
+                        existing[field] = account_data[field]
+                if account_data.get("plan") and existing.get("plan") in (None, "Unknown", "unknown"):
+                    existing["plan"] = account_data["plan"]
+                changed = True
+            else:
+                migrated[new_key] = account_data
+
+        if changed:
+            self.save_accounts(migrated)
+
+    def _account_auth_path(self, account_key: str, account_data: dict):
+        candidates = [account_key]
+        email = account_data.get("email")
+        if email and email not in candidates:
+            candidates.append(email)
+        for legacy in account_data.get("legacy_names", []):
+            if legacy and legacy not in candidates:
+                candidates.append(legacy)
+        old_alias = account_data.get("alias")
+        if old_alias and old_alias not in candidates:
+            candidates.append(old_alias)
+
+        for name in candidates:
+            path = self.accounts_dir / name / self.AUTH_FILENAME
+            if path.exists():
+                return path
+        return self.accounts_dir / account_key / self.AUTH_FILENAME
 
     @staticmethod
     def parse_jwt_email(jwt_token):
@@ -58,17 +126,65 @@ class CodexService:
         except:
             return 'unknown'
 
+    @staticmethod
+    def _codex_dir():
+        return Path.home() / ".codex"
+
+    @classmethod
+    def _current_auth_path(cls):
+        return cls._codex_dir() / cls.AUTH_FILENAME
+
+    def _auth_backup_dir(self):
+        path = self.accounts_dir / "backups"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _load_json(path: Path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _backup_current_auth(self, reason: str):
+        auth_file = self._current_auth_path()
+        if not auth_file.exists():
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_reason = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in reason)[:40]
+        backup_path = self._auth_backup_dir() / f"auth-{timestamp}-{safe_reason}.json"
+        shutil.copy2(auth_file, backup_path)
+        return backup_path
+
+    @staticmethod
+    def _atomic_copy_file(source: Path, target: Path):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+        shutil.copy2(source, tmp_path)
+        os.replace(tmp_path, target)
+        try:
+            os.utime(target, None)
+        except Exception:
+            pass
+
+    def _extract_auth_details(self, auth_data):
+        tokens = auth_data.get('tokens', {})
+        id_token = tokens.get('id_token', '')
+        email = self.parse_jwt_email(id_token)
+        return {
+            "email": email,
+            "plan": self.parse_jwt_plan(id_token) if id_token else "unknown",
+            "account_id": tokens.get('account_id', ''),
+            "last_refresh": auth_data.get('last_refresh', ''),
+        }
+
     def get_current_email_and_plan(self):
-        auth_file = Path.home() / ".codex" / "auth.json"
+        auth_file = self._current_auth_path()
         if not auth_file.exists():
             return None, None
         
         try:
-            with open(auth_file, 'r') as f:
-                data = json.load(f)
-            id_token = data.get('tokens', {}).get('id_token', '')
-            if id_token:
-                return self.parse_jwt_email(id_token), self.parse_jwt_plan(id_token)
+            details = self._extract_auth_details(self._load_json(auth_file))
+            if details["email"]:
+                return details["email"], details["plan"]
         except:
             pass
         return None, None
@@ -78,22 +194,19 @@ class CodexService:
         
         if not email:
             return {
-                'alias': 'Not logged in / 未登录',
                 'email': 'N/A',
                 'plan': 'N/A'
             }
         
         accounts = self.get_accounts()
-        for alias, data in accounts.items():
+        for _, data in accounts.items():
             if data.get('email', '').lower() == email.lower():
                 return {
-                    'alias': alias,
                     'email': email,
                     'plan': plan or data.get('plan', 'Unknown')
                 }
         
         return {
-            'alias': f'Unknown ({email.split("@")[0]})',
             'email': email,
             'plan': plan or 'Unknown'
         }
@@ -103,58 +216,144 @@ class CodexService:
         os.chmod(path, stat.S_IWRITE)
         func(path)
 
-    def add_account(self, alias):
+    def add_account(self):
         accounts = self.get_accounts()
-        if alias in accounts:
-            print(f"Alias '{alias}' already exists. / 别名 '{alias}' 已存在。")
-            return False
 
-        codex_dir = Path.home() / ".codex"
-        auth_file = codex_dir / "auth.json"
+        auth_file = self._current_auth_path()
         
         if not auth_file.exists():
             print(f"No auth.json found. Please login first. / 未找到 auth.json，请先登录账号。")
             return False
         
-        with open(auth_file, 'r') as f:
-            auth_data = json.load(f)
-        id_token = auth_data.get('tokens', {}).get('id_token', '')
-        email = self.parse_jwt_email(id_token)
-        plan = self.parse_jwt_plan(id_token)
+        auth_data = self._load_json(auth_file)
+        details = self._extract_auth_details(auth_data)
+        email = details["email"]
+        plan = details["plan"]
         
         if not email:
             print(f"Cannot parse email from auth.json. / 无法从 auth.json 解析邮箱。")
             return False
         
-        account_dir = self.accounts_dir / alias
-        if account_dir.exists():
-            shutil.rmtree(account_dir, onerror=self._remove_readonly)
-        account_dir.mkdir(parents=True)
+        account_dir = self.accounts_dir / email
+        existed = email in accounts
+        account_dir.mkdir(parents=True, exist_ok=True)
         
-        shutil.copy2(auth_file, account_dir / "auth.json")
+        self._atomic_copy_file(auth_file, account_dir / self.AUTH_FILENAME)
         
-        accounts[alias] = {
+        existing = accounts.get(email, {})
+        legacy_names = existing.get("legacy_names", [])
+        if not isinstance(legacy_names, list):
+            legacy_names = []
+
+        accounts[email] = {
             "email": email,
             "plan": plan,
-            "alias": alias
+            "account_id": details["account_id"],
+            "last_refresh": details["last_refresh"],
+            "saved_at": datetime.now().isoformat(timespec="seconds")
         }
+        if legacy_names:
+            accounts[email]["legacy_names"] = legacy_names
         self.save_accounts(accounts)
-        print(f"Account '{alias}' created. / 账号 '{alias}' 已创建。")
-        print(f"  Email: {email}")
+        action = "updated" if existed else "created"
+        action_cn = "已更新" if existed else "已创建"
+        print(f"Account '{email}' {action}. / 账号 '{email}' {action_cn}。")
         print(f"  Plan: {plan}")
         return True
 
-    def remove_account(self, alias):
+    def sync_current_account(self, silent=True):
+        auth_file = self._current_auth_path()
+        if not auth_file.exists():
+            return False
+
+        try:
+            auth_data = self._load_json(auth_file)
+            details = self._extract_auth_details(auth_data)
+        except Exception:
+            return False
+
+        email = details["email"]
+        account_id = details["account_id"]
+        if not email and not account_id:
+            return False
+
         accounts = self.get_accounts()
-        if alias in accounts:
-            account_dir = self.accounts_dir / alias
-            if account_dir.exists():
-                shutil.rmtree(account_dir, onerror=self._remove_readonly)
-            del accounts[alias]
+        matched_key = None
+        for key, data in accounts.items():
+            if email and data.get('email', '').lower() == email.lower():
+                matched_key = key
+                break
+            if account_id and data.get('account_id') == account_id:
+                matched_key = key
+                break
+
+        if not matched_key:
+            return False
+
+        account_dir = self.accounts_dir / matched_key
+        account_dir.mkdir(parents=True, exist_ok=True)
+        target_auth = account_dir / self.AUTH_FILENAME
+
+        changed = True
+        if target_auth.exists():
+            try:
+                changed = auth_file.read_bytes() != target_auth.read_bytes()
+            except Exception:
+                changed = True
+
+        if changed:
+            self._atomic_copy_file(auth_file, target_auth)
+
+        account_data = accounts[matched_key]
+        metadata_changed = False
+        for key, value in {
+            "email": email,
+            "plan": details["plan"],
+            "account_id": account_id,
+            "last_refresh": details["last_refresh"],
+        }.items():
+            if value and account_data.get(key) != value:
+                account_data[key] = value
+                metadata_changed = True
+
+        if changed:
+            account_data["saved_at"] = datetime.now().isoformat(timespec="seconds")
+            metadata_changed = True
+
+        if metadata_changed:
             self.save_accounts(accounts)
-            print(f"Account '{alias}' removed. / 账号 '{alias}' 已删除。")
+
+        if changed and not silent:
+            print(f"Updated saved login for account: {email}")
+        return changed or metadata_changed
+
+    def remove_account(self, account_key):
+        accounts = self.get_accounts()
+        if account_key in accounts:
+            account_data = accounts[account_key]
+            dirs_to_remove = [account_key]
+            for legacy in account_data.get("legacy_names", []):
+                if legacy and legacy not in dirs_to_remove:
+                    dirs_to_remove.append(legacy)
+            for dirname in dirs_to_remove:
+                account_dir = self.accounts_dir / dirname
+                if account_dir.exists():
+                    shutil.rmtree(account_dir, onerror=self._remove_readonly)
+            del accounts[account_key]
+            self.save_accounts(accounts)
+            print(f"Account '{account_key}' removed. / 账号 '{account_key}' 已删除。")
         else:
-            print(f"Account '{alias}' not found. / 未找到账号 '{alias}'。")
+            print(f"Account '{account_key}' not found. / 未找到账号 '{account_key}'。")
+
+    def clear_current_auth(self):
+        auth_file = self._current_auth_path()
+        backup_path = self._backup_current_auth("before-clean")
+        if auth_file.exists():
+            auth_file.unlink()
+        if backup_path:
+            print(f"Previous login backed up at: {backup_path}")
+        print("Switched to Default (Clean) environment. / 已切换到默认 (干净) 环境。")
+        self.refresh_codex_app()
 
     def get_usage_stats(self):
         """解析会话日志获取额度信息"""
@@ -233,244 +432,74 @@ class CodexService:
         except:
             return "Error parsing logs / 日志解析错误"
 
-    def switch_account(self, alias_or_fragment):
+    def switch_account(self, email_or_fragment):
+        self.sync_current_account(silent=False)
         accounts = self.get_accounts()
         
-        matched_alias = None
-        for alias in accounts.keys():
-            if alias_or_fragment.lower() in alias.lower():
-                matched_alias = alias
+        matched_key = None
+        needle = email_or_fragment.lower()
+        for key, data in accounts.items():
+            email = data.get("email", key)
+            if needle in email.lower() or needle in key.lower():
+                matched_key = key
                 break
         
-        if not matched_alias:
-            print(f"No account matched '{alias_or_fragment}'. / 未找到匹配 '{alias_or_fragment}' 的账号。")
+        if not matched_key:
+            print(f"No account matched '{email_or_fragment}'. / 未找到匹配 '{email_or_fragment}' 的账号。")
             return
         
-        target_auth = self.accounts_dir / matched_alias / "auth.json"
+        account_data = accounts[matched_key]
+        target_auth = self._account_auth_path(matched_key, account_data)
         
         if not target_auth.exists():
-            print(f"No auth.json found for '{matched_alias}'. / 账号 '{matched_alias}' 未找到认证文件。")
+            print(f"No auth.json found for '{matched_key}'. / 账号 '{matched_key}' 未找到认证文件。")
             return
+
+        self._warn_if_saved_auth_old(target_auth)
         
-        codex_dir = Path.home() / ".codex"
-        target_path = codex_dir / "auth.json"
-        shutil.copy2(target_auth, target_path)
-        try:
-            # 强制更新时间戳，触发可能存在的文件监听刷新
-            os.utime(target_path, None)
-        except Exception:
-            pass
+        codex_dir = self._codex_dir()
+        target_path = codex_dir / self.AUTH_FILENAME
+        backup_path = self._backup_current_auth(f"before-switch-{matched_key}")
+        self._atomic_copy_file(target_auth, target_path)
         
-        email = accounts[matched_alias].get('email', 'Unknown')
-        plan = accounts[matched_alias].get('plan', 'Unknown')
-        print(f"Successfully switched to account: {matched_alias} / 已成功切换至账号: {matched_alias}")
-        print(f"  Email: {email}")
+        email = account_data.get('email', matched_key)
+        plan = account_data.get('plan', 'Unknown')
+        print(f"Successfully switched to account: {email} / 已成功切换至账号: {email}")
         print(f"  Plan: {plan}")
-        self._refresh_with_auth_lock(target_path)
+        if backup_path:
+            print(f"Previous login backed up at: {backup_path}")
+        self.refresh_codex_app()
         self._verify_auth_persisted(expected_email=email)
 
+    def _warn_if_saved_auth_old(self, auth_path: Path, max_age_days: int = 14):
+        try:
+            auth_data = self._load_json(auth_path)
+            last_refresh = auth_data.get("last_refresh")
+            if not last_refresh:
+                return
+            normalized = last_refresh.replace("Z", "+00:00")
+            if "." in normalized:
+                head, tail = normalized.split(".", 1)
+                if "+" in tail:
+                    fraction, offset = tail.split("+", 1)
+                    normalized = f"{head}.{fraction[:6]}+{offset}"
+                elif "-" in tail:
+                    fraction, offset = tail.rsplit("-", 1)
+                    normalized = f"{head}.{fraction[:6]}-{offset}"
+            refreshed_at = datetime.fromisoformat(normalized)
+            if refreshed_at.tzinfo is None:
+                refreshed_at = refreshed_at.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - refreshed_at.astimezone(timezone.utc)).days
+            if age_days > max_age_days:
+                print(f"Saved login for this account is {age_days} days old. If Codex asks to login, login once and add/switch this account again.")
+        except Exception:
+            return
+
     def refresh_codex_app(self):
-        """尝试触发 Codex 立即刷新认证，无需重启主程序"""
-        try:
-            if os.name == "nt":
-                self._ensure_shell_snapshot_disabled()
-                self._ensure_pencil_mcp_proxy()
-                if self._restart_codex_desktop():
-                    print("已重启 Codex 桌面端，账号将自动刷新。")
-                    return True
-                pids = self._find_windows_codex_backend_pids()
-                if not pids:
-                    print("未检测到 Codex 后台进程，可能未启动或无权限。/ No Codex backend process found.")
-                    return False
-                for pid in pids:
-                    try:
-                        subprocess.run(
-                            ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid}"],
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                        )
-                        time.sleep(0.8)
-                        subprocess.run(
-                            ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                        )
-                    except Exception:
-                        continue
-                print("已请求 Codex 后台进程重启，账号将自动刷新。/ Codex backend restarted for auth refresh.")
-                return True
-
-            if platform.system() == "Darwin":
-                if self._restart_codex_desktop_macos():
-                    print("已重启 Codex 桌面端，账号将自动刷新。")
-                    return True
-
-            pids = self._find_unix_codex_backend_pids()
-            if not pids:
-                print("未检测到 Codex 后台进程，可能未启动或无权限。/ No Codex backend process found.")
-                return False
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except Exception:
-                    continue
-            print("已请求 Codex 后台进程重启，账号将自动刷新。/ Codex backend restarted for auth refresh.")
-            return True
-        except Exception:
-            print("自动刷新失败，请手动重启 Codex。/ Auto refresh failed, please restart Codex manually.")
-            return False
-
-    def _ensure_pencil_mcp_proxy(self):
-        if os.name != "nt":
-            return False
-        config_path = Path.home() / ".codex" / "config.toml"
-        if not config_path.exists():
-            return False
-        try:
-            text = config_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return False
-        if "[mcp_servers.pencil]" not in text:
-            return False
-
-        lines = text.splitlines(keepends=True)
-        section_re = re.compile(r"^\s*\[([^\]]+)\]\s*$")
-        cmd_re = re.compile(r'^\s*command\s*=\s*"(.*)"\s*$')
-        args_re = re.compile(r'^\s*args\s*=\s*\[(.*)\]\s*$')
-
-        start = None
-        end = None
-        for i, line in enumerate(lines):
-            m = section_re.match(line)
-            if m and m.group(1).strip() == "mcp_servers.pencil":
-                start = i
-                continue
-            if start is not None and m:
-                end = i
-                break
-        if start is None:
-            return False
-        if end is None:
-            end = len(lines)
-
-        cmd_line_idx = None
-        args_line_idx = None
-        cmd_value = None
-        args_value = []
-        for i in range(start + 1, end):
-            line = lines[i]
-            m_cmd = cmd_re.match(line)
-            if m_cmd:
-                cmd_line_idx = i
-                cmd_value = m_cmd.group(1)
-                continue
-            m_args = args_re.match(line)
-            if m_args:
-                args_line_idx = i
-                args_value = re.findall(r'"([^"]*)"', m_args.group(1))
-                continue
-
-        if not cmd_value:
-            return False
-        if cmd_value.endswith("mcp_proxy.py") or any("mcp_proxy.py" in a for a in args_value):
-            return True
-
-        proxy_path = (Path(__file__).parent / "mcp_proxy.py").resolve()
-        new_cmd = "py"
-        new_args = ["-3", str(proxy_path), "--", cmd_value] + args_value
-
-        def toml_quote(s: str) -> str:
-            return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-
-        new_cmd_line = f"command = {toml_quote(new_cmd)}\n"
-        new_args_line = "args = [ " + ", ".join(toml_quote(a) for a in new_args) + " ]\n"
-
-        if cmd_line_idx is None or args_line_idx is None:
-            return False
-
-        lines[cmd_line_idx] = new_cmd_line
-        lines[args_line_idx] = new_args_line
-
-        backup_path = self.accounts_dir / "pencil_mcp_original.json"
-        try:
-            backup_path.write_text(
-                json.dumps({"command": cmd_value, "args": args_value}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            config_path.write_text("".join(lines), encoding="utf-8")
-        except Exception:
-            return False
-        return True
-
-    @staticmethod
-    def _restart_codex_desktop():
-        cmd = (
-            "$pkg = Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue;"
-            "Get-Process -Name Codex,codex -ErrorAction SilentlyContinue | Stop-Process;"
-            "Start-Sleep -Milliseconds 500;"
-            "Get-Process -Name Codex,codex -ErrorAction SilentlyContinue | Stop-Process -Force;"
-            "if ($pkg) { Start-Process \"shell:AppsFolder\\$($pkg.PackageFamilyName)!App\"; };"
-            "Start-Sleep -Milliseconds 800;"
-            "if (Get-Process -Name Codex -ErrorAction SilentlyContinue) { Write-Output 'OK' }"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            return "OK" in (result.stdout or "")
-        except Exception:
-            return False
-
-    @staticmethod
-    def _restart_codex_desktop_macos():
-        try:
-            subprocess.run(
-                ["osascript", "-e", 'quit app "Codex"'],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            time.sleep(0.6)
-            subprocess.run(
-                ["open", "-a", "Codex"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            time.sleep(0.6)
-            return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def _ensure_shell_snapshot_disabled():
-        config_path = Path.home() / ".codex" / "config.toml"
-        if not config_path.exists():
-            return False
-        try:
-            text = config_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return False
-
-        line_re = re.compile(r'^\s*shell_snapshot\s*=\s*(true|false)\s*$', re.IGNORECASE | re.MULTILINE)
-        if line_re.search(text):
-            new_text = line_re.sub("shell_snapshot = false", text)
-        else:
-            suffix = "\n" if text.endswith("\n") else "\n\n"
-            new_text = text + f"{suffix}shell_snapshot = false\n"
-
-        if new_text == text:
-            return True
-        try:
-            config_path.write_text(new_text, encoding="utf-8")
-            return True
-        except Exception:
-            return False
+        """提示用户手动重启 Codex，避免工具杀掉当前桌面端进程。"""
+        print("账号文件已更新。工具不会启动、停止或修改 Codex/ChatGPT 桌面端。")
+        print("请完全关闭并重新打开 Codex/ChatGPT 桌面端，让账号切换生效。")
+        return False
 
     def _verify_auth_persisted(self, expected_email: str, wait_seconds: float = 1.5):
         if not expected_email:
@@ -485,109 +514,3 @@ class CodexService:
         if current_email.lower() == expected_email.lower():
             return
         print("Detected auth.json was overwritten by desktop cache. Please close and reopen Codex desktop, then retry.")
-
-    def _refresh_with_auth_lock(self, auth_path: Path, hold_seconds: float = 2.5):
-        """短暂锁定 auth.json 为只读，避免桌面端启动时回写旧账号"""
-        if os.name != "nt":
-            self.refresh_codex_app()
-            return
-        self._set_readonly(auth_path, True)
-        self.refresh_codex_app()
-        try:
-            time.sleep(hold_seconds)
-        except Exception:
-            pass
-        self._set_readonly(auth_path, False)
-
-    @staticmethod
-    def _set_readonly(path: Path, readonly: bool):
-        try:
-            if readonly:
-                os.chmod(path, stat.S_IREAD)
-            else:
-                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _find_windows_codex_backend_pids():
-        cmd = (
-            "$ids = @();"
-            "$procs = Get-Process -Name codex -ErrorAction SilentlyContinue | Where-Object {"
-            "  $p = $_.Path; if (-not $p) { $p = '' };"
-            "  $p -match 'resources\\\\\\\\codex\\.exe' -or $p -match 'app\\\\\\\\asar\\\\\\\\unpacked\\\\\\\\codex'"
-            "};"
-            "if ($procs) { $ids += $procs | Select-Object -ExpandProperty Id };"
-            "if (-not $ids) {"
-            "  try {"
-            "    $cim = Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | "
-            "      Select-Object ProcessId,ExecutablePath,CommandLine;"
-            "    foreach ($p in $cim) {"
-            "      $exe = $p.ExecutablePath; if (-not $exe) { $exe = '' };"
-            "      $cmd = $p.CommandLine; if (-not $cmd) { $cmd = '' };"
-            "      $path = $exe + ' ' + $cmd;"
-            "      if ($path -match 'resources\\\\\\\\codex\\.exe' -or $path -match 'app\\.asar\\.unpacked\\\\\\\\codex' -or $cmd -match 'app-server') {"
-            "        $ids += $p.ProcessId"
-            "      }"
-            "    }"
-            "  } catch { }"
-            "};"
-            "if (-not $ids) {"
-            "  try {"
-            "    $fallback = Get-Process -Name codex -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id;"
-            "    if ($fallback) { $ids += $fallback }"
-            "  } catch { }"
-            "};"
-            "$ids | Sort-Object -Unique"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.stdout:
-                pids = []
-                for line in result.stdout.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        pids.append(int(line))
-                    except ValueError:
-                        continue
-                return pids
-        except Exception:
-            return []
-        return []
-
-    @staticmethod
-    def _find_unix_codex_backend_pids():
-        try:
-            result = subprocess.run(
-                ["ps", "-ax", "-o", "pid=", "-o", "command="],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            pids = []
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if len(parts) != 2:
-                    continue
-                pid_str, cmd = parts
-                if "/resources/codex" not in cmd and "/resources/app.asar.unpacked/codex" not in cmd:
-                    continue
-                if "Codex.app/Contents/MacOS/Codex" in cmd:
-                    continue
-                try:
-                    pids.append(int(pid_str))
-                except ValueError:
-                    continue
-            return pids
-        except Exception:
-            return []

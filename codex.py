@@ -21,23 +21,13 @@ def _style(text, *codes):
 def _banner():
     line = "+" + "-" * 50 + "+"
     print(_style(line, "36"))
-    print(_style(f"| CODEx SWITCH {'v1.1.0':>34} |", "36", "1"))
+    print(_style(f"| CODEx SWITCH {'v1.2.0':>34} |", "36", "1"))
     print(_style("| account switcher                                |", "36"))
     print(_style(line, "36"))
 
 def _section(title):
     print(_style(title, "36", "1"))
     print(_style("-" * 50, "2"))
-
-def _mask_email(email):
-    if not email or "@" not in email:
-        return email
-    local, domain = email.split("@", 1)
-    if len(local) <= 2:
-        masked = local[0] + "**" if local else "**"
-    else:
-        masked = local[:3] + "**"
-    return masked + "@" + domain
 
 def check_installation():
     profile = Path.home() / ".zshrc" if os.name != 'nt' else Path.home() / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
@@ -58,6 +48,7 @@ def interactive_menu():
 
     service = CodexService()
     while True:
+        service.sync_current_account()
         # 获取当前账号详细信息
         current_info = service.get_current_account_info()
         usage = service.get_usage_stats()
@@ -66,10 +57,9 @@ def interactive_menu():
         _banner()
         print(f"\n{'='*50}")
         print("Current Account / 当前账号:")
-        print(" Alias / 别名 |  Email / 邮箱            |  Plan / 订阅 | Usage / 额度")
+        print(" Email / 邮箱            |  Plan / 订阅 | Usage / 额度")
         print(
-            f" {current_info['alias']:<12} |  "
-            f"{_mask_email(current_info['email']):<23} |  "
+            f" {current_info['email']:<23} |  "
             f"{current_info['plan']:<12}| "
             f"{usage}"
         )
@@ -91,22 +81,18 @@ def interactive_menu():
             else:
                 _section("Account List")
                 print(f"\n{'='*60}")
-                print(f"{'Alias/别名':<15} {'Email/邮箱':<30} {'Plan/订阅':<10}")
+                print(f"{'Email/邮箱':<32} {'Plan/订阅':<10}")
                 print(f"{'-'*60}")
-                for alias, data in accounts.items():
+                for email_key, data in accounts.items():
                     email = data.get('email', 'Unknown')
                     plan = data.get('plan', 'Unknown')
                     # 标记当前账号
                     marker = " *" if email.lower() == current_info['email'].lower() else ""
-                    print(f"{alias:<15} {email:<30} {plan:<10}{marker}")
+                    print(f"{email_key:<32} {plan:<10}{marker}")
                 print(f"{'='*60}")
                 print("* = Current account / * = 当前账号")
         elif choice == '2':
-            alias = input("Enter alias for new account (q to cancel) / 输入新账号别名(q 取消): ")
-            if alias.strip().lower() == "q":
-                print("Canceled. / 已取消。")
-                continue
-            service.add_account(alias)
+            service.add_account()
         elif choice == '3':
             accounts = service.get_accounts()
             if not accounts:
@@ -115,19 +101,18 @@ def interactive_menu():
             
             _section("Remove Account")
             print("\nSelect account to remove / 选择要删除的账号:")
-            aliases = list(accounts.keys())
-            for i, alias in enumerate(aliases):
-                email = accounts[alias].get('email', 'Unknown')
-                plan = accounts[alias].get('plan', 'Unknown')
-                print(f"  {i+1}. {alias} ({email} - {plan})")
+            account_keys = list(accounts.keys())
+            for i, email_key in enumerate(account_keys):
+                plan = accounts[email_key].get('plan', 'Unknown')
+                print(f"  {i+1}. {email_key} ({plan})")
             print("  q. Cancel / 取消")
             
             idx = input("Select index / 选择序号: ")
             if idx.strip().lower() == 'q':
                 print("Canceled. / 已取消。")
                 continue
-            if idx.isdigit() and 1 <= int(idx) <= len(aliases):
-                service.remove_account(aliases[int(idx)-1])
+            if idx.isdigit() and 1 <= int(idx) <= len(account_keys):
+                service.remove_account(account_keys[int(idx)-1])
             else:
                 print("Invalid choice / 无效选择")
         elif choice == '4':
@@ -136,26 +121,22 @@ def interactive_menu():
             _section("Switch Account")
             print("\nSelect account to switch / 选择要切换的账号:")
             print("  0. Default (Clean) / 默认 (干净环境)")
-            aliases = list(accounts.keys())
-            for i, alias in enumerate(aliases):
-                email = accounts[alias].get('email', 'Unknown')
-                plan = accounts[alias].get('plan', 'Unknown')
-                print(f"  {i+1}. {alias} ({email} - {plan})")
+            account_keys = list(accounts.keys())
+            for i, email_key in enumerate(account_keys):
+                plan = accounts[email_key].get('plan', 'Unknown')
+                print(f"  {i+1}. {email_key} ({plan})")
             print("  q. Cancel / 取消")
             
             idx = input("Select index / 选择序号: ")
             if idx == '0':
-                auth_file = Path.home() / ".codex" / "auth.json"
-                if auth_file.exists():
-                    auth_file.unlink()
-                print("Switched to Default (Clean) environment. / 已切换到默认 (干净) 环境。")
-                service.refresh_codex_app()
+                service.sync_current_account(silent=False)
+                service.clear_current_auth()
                 print("You can now login with a new account. / 您现在可以登录新账号。")
             elif idx.strip().lower() == 'q':
                 print("Canceled. / 已取消。")
                 continue
-            elif idx.isdigit() and 1 <= int(idx) <= len(aliases):
-                service.switch_account(aliases[int(idx)-1])
+            elif idx.isdigit() and 1 <= int(idx) <= len(account_keys):
+                service.switch_account(account_keys[int(idx)-1])
             else:
                 print("Invalid choice / 无效选择")
         elif choice.strip().lower() == 'q':
